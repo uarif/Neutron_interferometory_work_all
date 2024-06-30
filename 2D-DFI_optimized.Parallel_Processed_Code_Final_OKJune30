@@ -1,0 +1,442 @@
+import seaborn as sns
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+start_time = time.time()
+# Define parameters
+pi = np.pi
+p_G = 2.4E-6  # Grating period in meters
+x_1 = 0
+L_1 = 2  # meters
+lam = 5E-10  # Wavelength in meters
+L = 4  # meters, distance between last grating and camera
+h = 15E-6
+slit_size = 240E-6  # Slit size in meters
+
+# Function to calculate contrast V without sample
+def calculate_contrast_s_and_kmax_without_sample(d, lam):
+    k_0 = 2 * pi / lam
+    k_G = 2 * pi / p_G
+    L_2 = L - L_1 - d  # Total distance from source to camera
+    pm = L * p_G / d  # Moiré period
+    k_m = 2 * pi / pm  # Moiré wave vector
+    M1 = 1 + d / L_1  # First magnification
+    M2 = 1 + (L_2) / (L_1 + d)  # Second magnification without sample
+    m_max = 5  # Maximum absolute value of m (odd)
+
+    def generate_G1(m_max, k_G, x_1, h):
+        G1 = []  # Initialize G1 as an empty list
+        G1.append([0, np.cos((pi / 2) / 2)])
+        m_values = [m for m in range(-m_max, m_max + 1) if m % 2 != 0]
+        for m in m_values:
+            wave_vector = m * k_G
+            amplitude = (2 / (m * pi)) * np.sin((pi / 2) / 2) * np.exp(1j * m * k_G * x_1)
+            G1.append([wave_vector, amplitude])
+        return G1
+
+    def custom_convolution(P1, G1):
+        P2 = []
+        for row in G1:
+            wave_vector, amplitude = row
+            result = (P1[0] + wave_vector, P1[1] * amplitude)
+            P2.append(result)
+        return P2
+
+    def scale_wave_vectors(P2, M1):
+        P2n = [(wave_vector / M1, amplitude) for wave_vector, amplitude in P2]
+        return P2n
+
+    def phaseterm(P2n, d, k_0, M1):
+        P3 = [
+            (
+                wave_vector,
+                np.exp(-1j * d * (wave_vector**2) / (2 * (k_0 / M1))) * amplitude
+            )
+            for wave_vector, amplitude in P2n
+        ]
+        return P3
+
+    def custom_convolution2(P3, G1):
+        P4 = []
+        for p3_row in P3:
+            wave_vector_p3, amplitude_p3 = p3_row
+            for g1_row in G1:
+                wave_vector_g1, amplitude_g1 = g1_row
+                result2 = (wave_vector_p3 + wave_vector_g1, amplitude_p3 * amplitude_g1)
+                P4.append(result2)
+        return P4
+
+    def scale_wave_vectors2(P4, M1, M2):
+        P4n = [(wave_vector / M2, amplitude) for wave_vector, amplitude in P4]
+        return P4n
+
+    def phaseterm2(P4n, d, k_0, M1, M2):
+        P5 = [
+            (
+                wave_vector,
+                np.exp(-1j * L_2 * ((wave_vector**2) / (2 * (k_0 / (M1 * M2)))) / M1) * amplitude
+            )
+            for wave_vector, amplitude in P4n
+        ]
+        return P5
+
+    def compute_P5_conj(P5):
+        P5_conj = []
+        for wave_vector, amplitude in P5:
+            first_term_conj = -wave_vector
+            second_term_conj = np.conj(amplitude)
+            P5_conj.append((first_term_conj, second_term_conj))
+        return P5_conj
+
+    def H_convolution_4(P5, P5_conj):
+        H = []
+        for P5_row in P5:
+            wave_vector_P5, amplitude_P5 = P5_row
+            for P5_conj_row in P5_conj:
+                wave_vector_P5_conj, amplitude_P5_conj = P5_conj_row
+                result4 = (wave_vector_P5 + wave_vector_P5_conj, amplitude_P5 * amplitude_P5_conj)
+                H.append(result4)
+        return H
+
+    G1 = generate_G1(m_max, k_G, x_1, h)
+    P1 = [0, 1]  # Initial conditions for convolution
+    P2 = custom_convolution(P1, G1)
+    P2n = scale_wave_vectors(P2, M1)
+    P3 = phaseterm(P2n, d, k_0, M1)
+    P4 = custom_convolution2(P3, G1)
+    P4n = scale_wave_vectors2(P4, M1, M2)
+    P5 = phaseterm2(P4n, d, k_0, M1, M2)
+    P5_conj = compute_P5_conj(P5)
+    H = H_convolution_4(P5, P5_conj)
+
+    def aggregate_amplitudes(H):
+        wave_vector_sums = {}
+        for wave_vector, amplitude in H:
+            rounded_wave_vector = np.round(wave_vector, 1)
+            if rounded_wave_vector in wave_vector_sums:
+                wave_vector_sums[rounded_wave_vector] += amplitude
+            else:
+                wave_vector_sums[rounded_wave_vector] = amplitude
+        H_reduced = [(wave_vector, amplitude) for wave_vector, amplitude in wave_vector_sums.items()]
+        return H_reduced
+
+    H_reduced = aggregate_amplitudes(H)
+
+    def find_max_amplitude_and_wave_vector(H_reduced, k_m):
+        max_ampl = 0
+        k_max = 0
+        for wave_vector, amplitude in H_reduced:
+            if 0.9 * k_m <= wave_vector <= 1.1 * k_m:
+                if amplitude > max_ampl:
+                    max_ampl = amplitude
+                    k_max = wave_vector
+        return max_ampl, k_max
+
+    def find_H0(H_reduced):
+        H_0 = 0
+        for wave_vector, amplitude in H_reduced:
+            if wave_vector == 0:
+                H_0 = amplitude
+                break
+        return H_0
+
+    Max_ampl, K_max = find_max_amplitude_and_wave_vector(H_reduced, k_m)
+    H_0 = find_H0(H_reduced)
+
+    V = np.abs(2 * Max_ampl / (H_0)) if H_0 != 0 else None
+
+    return V, K_max
+
+# Define the range of d values to iterate over
+d_values = np.arange(0.001, 0.100, 0.002)  # Range of d values in meters"""
+
+# Calculate V without sample for each d using parallel processing
+V_values = np.zeros(len(d_values))
+with ThreadPoolExecutor() as executor:
+    futures = {executor.submit(calculate_contrast_s_and_kmax_without_sample, d, lam): i for i, d in enumerate(d_values)}
+    for future in as_completed(futures):
+        i = futures[future]
+        V, _ = future.result()
+        V_values[i] = V
+
+# Plot V vs d
+"""plt.figure(figsize=(10, 6))
+plt.plot(d_values, V_values, label='V without sample')
+plt.xlabel('d (m)')
+plt.ylabel('V')
+plt.title('V vs d without sample')
+plt.legend()
+plt.grid(True)
+plt.show()"""
+# Define parameters
+pi = np.pi
+p_G = 2.4E-6  # Grating period in meters
+x_1 = 0
+L_1 = 2  # meters
+lam = 5E-10  # Wavelength in meters
+L = 4  # meters, distance between last grating and camera
+L_s = L / 3
+h = 15E-6
+N = 5E28
+b = 4.1491E-15
+slit_size = 240E-6  # Slit size in meters
+lambdas = [5E-10]  # List of wavelengths to evaluate
+P1 = [0, 1]  # Initial conditions for convolution
+
+# Function to calculate contrast V and K_max with sample
+def calculate_contrast_s_and_kmax_with_sample(d, lam, p_s):
+    k_0 = 2 * pi / lam
+    k_G = 2 * pi / p_G
+    k_s = 2 * pi / p_s
+    L_2s = L - L_1 - d - L_s  # Total distance from source to camera
+    pm = L * p_G / d  # Moiré period
+    k_m = 2 * pi / pm  # Moiré wave vector
+    M1 = 1 + d / L_1  # First magnification
+    M2s = 1 + (L_2s) / (L_1 + d)  # Second magnification with sample
+    M3 = 1 + L_s / (L_1 + d + L_2s)  # Third magnification with sample
+
+    m_max = 5  # Maximum absolute value of m (odd)
+
+    def generate_G1(m_max, k_G, x_1, h):
+        G1 = []  # Initialize G1 as an empty list
+        G1.append([0, np.cos((pi / 2) / 2)])
+        m_values = [m for m in range(-m_max, m_max + 1) if m % 2 != 0]
+        for m in m_values:
+            wave_vector = m * k_G
+            amplitude = (2 / (m * pi)) * np.sin((pi / 2) / 2) * np.exp(1j * m * k_G * x_1)
+            G1.append([wave_vector, amplitude])
+        return G1
+
+    def generate_Gs1(m_max, k_s):
+        Gs1 = []  # Initialize Gs1 as an empty list
+        Gs1.append([0, np.cos((pi / 2) / 2)])
+        m_values = [m for m in range(-m_max, m_max + 1) if m % 2 != 0]
+        for m in m_values:
+            wave_vector = m * k_s
+            amplitude = (2 / (m * pi)) * np.sin((pi / 2) / 2)
+            Gs1.append([wave_vector, amplitude])
+        return Gs1
+
+    def custom_convolution(P1, G1):
+        P2 = []
+        for row in G1:
+            wave_vector, amplitude = row
+            result = (P1[0] + wave_vector, P1[1] * amplitude)
+            P2.append(result)
+        return P2
+
+    def scale_wave_vectors(P2, M1):
+        P2n = [(wave_vector / M1, amplitude) for wave_vector, amplitude in P2]
+        return P2n
+
+    def phaseterm(P2n, d, k_0, M1):
+        P3 = [
+            (
+                wave_vector,
+                np.exp(-1j * d * (wave_vector**2) / (2 * (k_0 / M1))) * amplitude
+            )
+            for wave_vector, amplitude in P2n
+        ]
+        return P3
+
+    def custom_convolution2(P3, G1):
+        P4 = []
+        for p3_row in P3:
+            wave_vector_p3, amplitude_p3 = p3_row
+            for g1_row in G1:
+                wave_vector_g1, amplitude_g1 = g1_row
+                result2 = (wave_vector_p3 + wave_vector_g1, amplitude_p3 * amplitude_g1)
+                P4.append(result2)
+        return P4
+
+    def scale_wave_vectors2(P4, M1, M2s):
+        P4n = [(wave_vector / M2s, amplitude) for wave_vector, amplitude in P4]
+        return P4n
+
+    def phaseterm2(P4n, d, k_0, M1, M2s):
+        P5 = [
+            (
+                wave_vector,
+                np.exp(-1j * L_2s * ((wave_vector**2) / (2 * (k_0 / (M1 * M2s)))) / M1) * amplitude
+            )
+            for wave_vector, amplitude in P4n
+        ]
+        return P5
+
+    def custom_convolution3(P5, Gs1):
+        P6 = []
+        for P5_row in P5:
+            wave_vector_p5, amplitude_p5 = P5_row
+            for gs1_row in Gs1:
+                wave_vector_gs1, amplitude_gs1 = gs1_row
+                result_Gs1 = (wave_vector_p5 + wave_vector_gs1, amplitude_p5 * amplitude_gs1)
+                P6.append(result_Gs1)
+        return P6
+
+    def scale_wave_vectors3(P6, M1, M2s, M3):
+        P6n = [(wave_vector / M3, amplitude) for wave_vector, amplitude in P6]
+        return P6n
+
+    def phaseterm3(P6n, d, k_0, M1, M2s, M3):
+        P7 = [
+            (
+                wave_vector,
+                np.exp(-1j * L_s * ((wave_vector**2) / (2 * (k_0 / (M1 * M2s * M3)))) / (M1 * M2s)) * amplitude
+            )
+            for wave_vector, amplitude in P6n
+        ]
+        return P7
+
+    def compute_P7_conj(P7):
+        P7_conj = []
+        for wave_vector, amplitude in P7:
+            first_term_conj = -wave_vector
+            second_term_conj = np.conj(amplitude)
+            P7_conj.append((first_term_conj, second_term_conj))
+        return P7_conj
+
+    def H_sample_convolution_5(P7, P7_conj):
+        H_sample = []
+        for P7_row in P7:
+            wave_vector_P7, amplitude_P7 = P7_row
+            for P7_conj_row in P7_conj:
+                wave_vector_P7_conj, amplitude_P7_conj = P7_conj_row
+                result4 = (wave_vector_P7 + wave_vector_P7_conj, amplitude_P7 * amplitude_P7_conj)
+                H_sample.append(result4)
+        return H_sample
+
+    G1 = generate_G1(m_max, k_G, x_1, h)
+    Gs1 = generate_Gs1(m_max, k_s)
+    P2 = custom_convolution(P1, G1)
+    P2n = scale_wave_vectors(P2, M1)
+    P3 = phaseterm(P2n, d, k_0, M1)
+    P4 = custom_convolution2(P3, G1)
+    P4n = scale_wave_vectors2(P4, M1, M2s)
+    P5 = phaseterm2(P4n, d, k_0, M1, M2s)
+    P6 = custom_convolution3(P5, Gs1)
+    P6n = scale_wave_vectors3(P6, M1, M2s, M3)
+    P7 = phaseterm3(P6n, d, k_0, M1, M2s, M3)
+    P7_conj = compute_P7_conj(P7)
+    H_sample = H_sample_convolution_5(P7, P7_conj)
+
+    def aggregate_amplitudes(H_sample):
+        wave_vector_sums = {}
+        for wave_vector, amplitude in H_sample:
+            rounded_wave_vector = np.round(wave_vector, 1)
+            if rounded_wave_vector in wave_vector_sums:
+                wave_vector_sums[rounded_wave_vector] += amplitude
+            else:
+                wave_vector_sums[rounded_wave_vector] = amplitude
+        H_sample_reduced = [(wave_vector, amplitude) for wave_vector, amplitude in wave_vector_sums.items()]
+        return H_sample_reduced
+
+    H_sample_reduced = aggregate_amplitudes(H_sample)
+
+    def find_max_amplitude_and_wave_vector(H_sample_reduced, k_m):
+        max_ampl = 0
+        k_max = 0
+        for wave_vector, amplitude in H_sample_reduced:
+            if 0.9 * k_m <= wave_vector <= 1.1 * k_m:
+                if amplitude > max_ampl:
+                    max_ampl = amplitude
+                    k_max = wave_vector
+        return max_ampl, k_max
+
+    def find_H0_sample(H_sample_reduced):
+        H_0_sample = 0
+        for wave_vector, amplitude in H_sample_reduced:
+            if wave_vector == 0:
+                H_0_sample = amplitude
+                break
+        return H_0_sample
+
+    Max_ampl, K_max = find_max_amplitude_and_wave_vector(H_sample_reduced, k_m)
+    H_0_sample = find_H0_sample(H_sample_reduced)
+
+    sinc_km = np.sinc(k_m * slit_size / (2 * pi))
+    sinc_H0 = np.sinc(H_0_sample * slit_size / (2 * pi)) if H_0_sample != 0 else 0
+
+    V_sample = np.abs(2 * Max_ampl / (H_0_sample)) if H_0_sample != 0 else None
+
+    return V_sample, K_max
+from scipy.interpolate import interp1d
+# Define the range of d and p_s values to iterate over
+#d_values = np.arange(0.001, 0.015, 0.001)  # Range of d values in meters
+# Define ranges
+#d_values = np.arange(0.001, 0.015, 0.001)  # Range of d values in meters
+p_s_values = np.arange(0.1 * p_G, 3 * p_G, 0.2 * p_G)
+
+# Initialize dictionaries to store V_sample for each p_s
+V_sample_dict = {p_s: [] for p_s in p_s_values}
+
+# Function to process each combination of p_s and d
+def process_combination(p_s):
+    V_samples = []
+    for d in d_values:
+        V_sample, _ = calculate_contrast_s_and_kmax_with_sample(d, lam, p_s)
+        V_samples.append(V_sample)
+    return p_s, V_samples
+
+# Use ThreadPoolExecutor to parallelize the computation
+with ThreadPoolExecutor(max_workers=4) as executor:  # Adjust max_workers as needed
+    futures = [executor.submit(process_combination, p_s) for p_s in p_s_values]
+    for future in as_completed(futures):
+        p_s, V_samples = future.result()
+        V_sample_dict[p_s] = V_samples
+
+# Convert dictionaries to arrays for plotting
+V_sample_dict = {p_s: np.array(vals) for p_s, vals in V_sample_dict.items()}
+
+# Compute V values for d_values without sample
+V_values = np.array([calculate_contrast_s_and_kmax_without_sample(d, lam)[0] for d in d_values])
+
+# Initialize V_ratio_dict for storing V_ratio values
+V_ratio_dict = {p_s: [] for p_s in p_s_values}
+
+# Function to compute V_ratio for a given p_s and d
+def compute_V_ratio(p_s, d_idx):
+    V_sample = V_sample_dict[p_s][d_idx]
+    V = V_values[d_idx]
+    V_ratio = V_sample / V if V > 0 else np.nan
+    return V_ratio if V_ratio <= 1 else np.nan
+
+# Perform computations in parallel
+with ThreadPoolExecutor(max_workers=4) as executor:  # Adjust max_workers as needed
+    futures = []
+    for p_s in p_s_values:
+        for d_idx in range(len(d_values)):
+            futures.append((executor.submit(compute_V_ratio, p_s, d_idx), p_s))
+
+    for future, p_s_value in futures:
+        result = future.result()
+        V_ratio_dict[p_s_value].append(result)
+
+# Convert V_ratio_dict to arrays for plotting
+V_ratio_dict = {p_s: np.array(vals) for p_s, vals in V_ratio_dict.items()}
+
+# Create a 2D array for contour plot
+d_mesh, p_s_mesh = np.meshgrid(d_values, p_s_values)
+V_ratio_mesh = np.array([V_ratio_dict[p_s] for p_s in p_s_values])
+
+# Interpolate or fill missing values in V_ratio_mesh
+mask = np.isnan(V_ratio_mesh)
+for i in range(V_ratio_mesh.shape[0]):
+    row = V_ratio_mesh[i, :]
+    mask_row = mask[i, :]
+    if np.any(~mask_row):  # Check if there are non-NaN values to interpolate
+        row_interp = interp1d(d_values[~mask_row], row[~mask_row], kind='linear', fill_value='extrapolate')
+        row_interp_values = row_interp(d_values)
+        V_ratio_mesh[i, mask_row] = row_interp_values[mask_row]
+
+# Plot the contour plot
+plt.figure(figsize=(15, 9))
+contour = plt.contourf(d_mesh, p_s_mesh, V_ratio_mesh, levels=100, cmap='viridis')
+plt.colorbar(contour)
+plt.xlabel('d (m)')
+plt.ylabel('p_s (m)')
+plt.title('V_ratio as a function of d and p_s')
+plt.show()
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Execution time: {elapsed_time:.4f} seconds")
